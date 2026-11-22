@@ -2,7 +2,7 @@
 #!/bin/bash
 
 # DataVault - Automated PostgreSQL Backup Engine
-# Version: 2.0
+# Version: 3.0
 
 set -Eeuo pipefail
 umask 077
@@ -20,6 +20,9 @@ DB_NAME="${DB_NAME:-datavault_db}"
 DB_USER="${DB_USER:-datavault}"
 
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
+S3_BUCKET="${S3_BUCKET:-datavault-backups-2500}"
+S3_PREFIX="${S3_PREFIX:-backups}"
+
 
 TIMESTAMP="$(date +'%Y%m%d_%H%M%S')"
 BACKUP_FILE="$BACKUP_DIR/${DB_NAME}_${TIMESTAMP}.sql.gz"
@@ -50,7 +53,6 @@ if ! [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-# Prevent overlapping backup executions
 exec 9>"$BACKUP_DIR/.backup.lock"
 
 if ! flock -n 9; then
@@ -62,15 +64,13 @@ log "========================================"
 log "DataVault backup process started"
 log "Database: $DB_NAME"
 
-# Check required commands
-for command in docker gzip flock find du; do
+for command in docker gzip flock find du grep aws; do
     if ! command -v "$command" >/dev/null 2>&1; then
         log "ERROR: Required command not found: $command"
         exit 1
     fi
 done
 
-# Check PostgreSQL container
 if ! docker inspect \
     -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qx true; then
 
@@ -78,7 +78,6 @@ if ! docker inspect \
     exit 1
 fi
 
-# Check database connectivity
 if ! docker exec "$CONTAINER_NAME" \
     pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
 
@@ -101,7 +100,6 @@ if ! docker exec "$CONTAINER_NAME" pg_dump \
     exit 1
 fi
 
-# Reject empty backups
 if [[ ! -s "$TEMP_FILE" ]]; then
     log "ERROR: Generated backup is empty"
     exit 1
@@ -116,16 +114,32 @@ if ! gzip -t "$TEMP_FILE"; then
     exit 1
 fi
 
-# Verify PostgreSQL dump structure
-if ! gzip -dc "$TEMP_FILE" | grep -q 'PostgreSQL database dump'; then
+if ! gzip -dc "$TEMP_FILE" | grep -F 'PostgreSQL database dump' >/dev/null; then
     log "ERROR: Invalid PostgreSQL dump format"
     exit 1
 fi
 
-# ---------------- PUBLISH BACKUP ----------------
-
+# ---------------- PUBLISH LOCAL BACKUP ----------------
 mv "$TEMP_FILE" "$BACKUP_FILE"
 TEMP_FILE=""
+
+log "Local backup created: $BACKUP_FILE"
+
+# ---------------- AWS S3 UPLOAD ----------------
+
+S3_URI="s3://${S3_BUCKET}/${S3_PREFIX}/"
+
+log "Uploading backup to AWS S3"
+
+if ! aws s3 cp "$BACKUP_FILE" "$S3_URI" --only-show-errors; then
+    log "ERROR: AWS S3 upload failed"
+    log "Local backup preserved: $BACKUP_FILE"
+    exit 1
+fi
+
+log "AWS S3 upload completed: $S3_URI"
+
+# ---------------- BACKUP SUMMARY ----------------
 
 BACKUP_SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
 
@@ -139,7 +153,7 @@ log "Execution time: ${DURATION} seconds"
 
 # ---------------- RETENTION MANAGEMENT ----------------
 
-log "Applying retention policy: ${RETENTION_DAYS} days"
+log "Applying local retention policy: ${RETENTION_DAYS} days"
 
 find "$BACKUP_DIR" \
     -maxdepth 1 \
@@ -148,6 +162,6 @@ find "$BACKUP_DIR" \
     -mtime "+$RETENTION_DAYS" \
     -delete
 
-log "Retention cleanup completed"
+log "Local retention cleanup completed"
 log "DataVault backup process finished successfully"
 log "========================================"
