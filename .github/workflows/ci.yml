@@ -1,4 +1,3 @@
-
 name: DataVault CI
 
 on:
@@ -49,3 +48,8 @@ jobs:
       - name: Validate Terraform configuration
         working-directory: infrastructure/terraform
         run: terraform validate
+
+      - name: Validate Docker Compose
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
